@@ -921,6 +921,12 @@ def save_experiment_record(record):
         pickle.dump(record, f)
 
 
+def experiment_record_exists(graph_name, graph_source):
+    experiment_id = make_experiment_id(graph_source, graph_name)
+    file_path = RAW_RESULT_DIR / f"{experiment_id}.pkl"
+    return file_path.exists()
+
+
 def load_experiment_records():
     if not RAW_RESULT_DIR.exists():
         return []
@@ -1003,12 +1009,16 @@ def evaluate_experiment_record(record):
 # 5. 数据加载
 # ---------------------------------------------------------
 
+def relabel_graph_to_integers(graph: nx.Graph) -> nx.Graph:
+    return nx.convert_node_labels_to_integers(graph, ordering='sorted')
+
+
 def load_real_graph(graph_path: Path) -> nx.Graph:
     graph = nx.read_edgelist(graph_path, nodetype=int)
     if not isinstance(graph, nx.Graph) or graph.is_directed():
         graph = nx.Graph(graph)
     # ABRA 等方法依赖 0..n-1 的连续节点编号，真实数据需要先重编号。
-    return nx.convert_node_labels_to_integers(graph, ordering='sorted')
+    return relabel_graph_to_integers(graph)
 
 
 def iter_real_graphs(data_dir: Path) -> List[Tuple[str, nx.Graph]]:
@@ -1030,9 +1040,9 @@ def set_global_seed(seed: int) -> None:
 
 def ensure_connected(G: nx.Graph) -> nx.Graph:
     if nx.is_connected(G):
-        return G
+        return relabel_graph_to_integers(G)
     largest_cc = max(nx.connected_components(G), key=len)
-    return G.subgraph(largest_cc).copy()
+    return relabel_graph_to_integers(G.subgraph(largest_cc).copy())
 
 def iter_synthetic_graphs(seed: int = SEED) -> Iterator[Tuple[str, nx.Graph]]:
     configs = [
@@ -1054,14 +1064,15 @@ def iter_synthetic_graphs(seed: int = SEED) -> Iterator[Tuple[str, nx.Graph]]:
 
         # 只用于扩展性实验，不建议跑 exact BC
         ("BA10000", "BA", 10000, seed + 31),
-        ("WS10000", "WS", 10000, seed + 32),
-        ("ER10000", "ER", 10000, seed + 33),
+        # ("WS10000", "WS", 10000, seed + 32),
+        # ("ER10000", "ER", 10000, seed + 33),
     ]
 
     for name, graph_type, n, graph_seed in configs:
         if graph_type == "BA":
             # 平均度约 2m = 10
             G = nx.barabasi_albert_graph(n, 5, seed=graph_seed)
+            G = relabel_graph_to_integers(G)
 
         elif graph_type == "WS":
             # k=10，平均度为 10
@@ -1193,11 +1204,17 @@ def run_all_experiments(seed: int = SEED):
     set_global_seed(seed)
 
     for index, (graph_name, graph) in enumerate(iter_synthetic_graphs(seed=seed), start=1):
+        if experiment_record_exists(graph_name, "synthetic"):
+            print(f"Skip existing experiment: synthetic/{graph_name}")
+            continue
         set_global_seed(seed + index)
         run_experiment(graph, graph_name, "synthetic")
 
     real_graph_offset = 1000
     for index, (graph_name, graph) in enumerate(iter_real_graphs(DATA_DIR), start=1):
+        if experiment_record_exists(graph_name, "real"):
+            print(f"Skip existing experiment: real/{graph_name}")
+            continue
         set_global_seed(seed + real_graph_offset + index)
         run_experiment(graph, graph_name, "real")
 
