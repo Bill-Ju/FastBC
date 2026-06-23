@@ -1407,7 +1407,7 @@ def run_experiment(G, graph_name, graph_source):
 
     top_k_ratio = 0.1
     top_k = topk_count(G.number_of_nodes(), top_k_ratio)
-    epsilon_sizes = [0.2]  # [0.5, 0.3, 0.2, 0.1]
+    epsilon_sizes = [0.1]  # [0.5, 0.3, 0.2, 0.1]
     method_order = ['BP', 'RK', 'ABRA', 'SILVAN', 'GPU_SIR_BRIDGE']
     epsilon_results = []
 
