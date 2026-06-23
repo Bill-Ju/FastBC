@@ -23,6 +23,43 @@ RAW_RESULT_DIR = RESULT_DIR / "raw"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SEED = 42
 
+# GPU_SIR_BRIDGE 计算模式:
+# - "single_source": 原单源传播版本
+# - "random_sources": 随机多源传播版本
+GPU_SIR_BRIDGE_MODE = "single_source"
+# GPU_SIR_BRIDGE_MODE = "random_sources"
+
+# 你可以直接修改这里的参数。
+GPU_SIR_BRIDGE_SINGLE_CONFIG = {
+    "steps": 10,
+    "batch_size": 256,
+    "weight_attr": None,
+    "directed": False,
+    "device": None,
+    "eps": 1e-8,
+    "normalize": False,
+    "return_hist": False,
+    "early_stop": False,
+    "threshold": 1e-8,
+}
+
+# 你可以直接修改这里的参数。
+GPU_SIR_BRIDGE_RANDOM_SOURCES_CONFIG = {
+    "steps": 10,
+    "num_samples": 512,
+    "seed_ratio": 0.05,
+    "batch_size": 64,
+    "weight_attr": None,
+    "directed": False,
+    "device": None,
+    "eps": 1e-8,
+    "normalize": False,
+    "exclude_seed_nodes": True,
+    "early_stop": False,
+    "threshold": 1e-8,
+    "random_seed": None,
+}
+
 # ---------------------------------------------------------
 # 精确介数中心性（Brandes）
 # ---------------------------------------------------------
@@ -628,7 +665,7 @@ class ParallelSIRBridgeCentrality(nn.Module):
         Parameters
         ----------
         edge_index : [2, E]
-        source_nodes : [B] 一批传播源
+        source_nodes : [B] 或 [B, K] 一批传播源
         edge_weight : [E] or None (per-edge beta)
         return_hist : bool
         early_stop : bool
@@ -664,10 +701,18 @@ class ParallelSIRBridgeCentrality(nn.Module):
         S = torch.ones(B, N, device=self.device, dtype=torch.float32)
         R = torch.zeros(B, N, device=self.device, dtype=torch.float32)
 
-        # I[b, source_nodes[b]] = 1.0; S[b, source_nodes[b]] = 0.0
         row_idx = torch.arange(B, device=self.device)
-        I[row_idx, source_nodes] = 1.0
-        S[row_idx, source_nodes] = 0.0
+        if source_nodes.dim() == 1:
+            # I[b, source_nodes[b]] = 1.0; S[b, source_nodes[b]] = 0.0
+            I[row_idx, source_nodes] = 1.0
+            S[row_idx, source_nodes] = 0.0
+        elif source_nodes.dim() == 2:
+            K = source_nodes.shape[1]
+            row_idx = row_idx.unsqueeze(1).expand(B, K)
+            I[row_idx, source_nodes] = 1.0
+            S[row_idx, source_nodes] = 0.0
+        else:
+            raise ValueError("source_nodes must have shape [B] or [B, K]")
 
         # --- 缓存 [T+1, B, N] ---
         S_hist = torch.zeros(T + 1, B, N, device=self.device)
@@ -826,15 +871,106 @@ def compute_gpu_bridge_centrality(G, beta=0.3, gamma=0.1, steps=10,
     total = len(source_nodes)
     all_sps = []
 
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch_src = source_nodes[start:end]
-        sps = model(edge_index, batch_src, edge_weight,
-                    return_hist=False, early_stop=early_stop,
-                    threshold=threshold)
-        all_sps.append(sps)
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch_src = source_nodes[start:end]
+            sps = model(edge_index, batch_src, edge_weight,
+                        return_hist=False, early_stop=early_stop,
+                        threshold=threshold)
+            all_sps.append(sps.detach())
 
     # 统一平均
+    score = torch.cat(all_sps, dim=0).mean(dim=0).cpu().numpy()
+
+    if normalize:
+        mn, mx = score.min(), score.max()
+        if mx - mn > 1e-15:
+            score = (score - mn) / (mx - mn)
+
+    runtime = time.perf_counter() - t0
+    result = {rev_map[i]: float(score[i]) for i in range(N)}
+    return result, runtime
+
+
+def compute_gpu_bridge_centrality_random_sources(
+    G,
+    beta=0.2,
+    gamma=0.1,
+    steps=10,
+    num_samples=1024,
+    seed_ratio=0.05,
+    batch_size=64,
+    weight_attr=None,
+    directed=False,
+    device=None,
+    eps=1e-8,
+    normalize=False,
+    exclude_seed_nodes=True,
+    early_stop=False,
+    threshold=1e-8,
+    random_seed=None,
+):
+    """
+    随机多源传播版本：每次随机采样一组种子节点，重复多次后对 bridge score 取平均。
+
+    Returns
+    -------
+    score : dict {original_node_id: score}
+    runtime : float
+    """
+
+    t0 = time.perf_counter()
+
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+
+    if random_seed is not None:
+        torch.manual_seed(random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_seed)
+
+    edge_index, edge_weight, node_map, rev_map = nx_to_pyg_edge_index(
+        G, directed=directed, weight_attr=weight_attr, device=device)
+    N = len(G.nodes())
+    seed_size = max(1, int(round(seed_ratio * N)))
+
+    model = ParallelSIRBridgeCentrality(N, steps, beta, gamma, eps, device)
+    all_sps = []
+
+    with torch.no_grad():
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            cur_bs = end - start
+
+            rand_mat = torch.rand(cur_bs, N, device=device)
+            seed_sets = torch.topk(
+                rand_mat,
+                k=seed_size,
+                dim=1,
+                largest=False,
+            ).indices
+
+            sps = model(
+                edge_index,
+                seed_sets,
+                edge_weight,
+                return_hist=False,
+                early_stop=early_stop,
+                threshold=threshold,
+            ).detach()
+
+            if exclude_seed_nodes:
+                row_idx = torch.arange(cur_bs, device=device).unsqueeze(1).expand_as(seed_sets)
+                sps[row_idx, seed_sets] = 0.0
+
+            all_sps.append(sps)
+
     score = torch.cat(all_sps, dim=0).mean(dim=0).cpu().numpy()
 
     if normalize:
@@ -867,6 +1003,10 @@ def topk_accuracy(exact, approx, k):
     return hit / k
 
 
+def topk_count(num_nodes, ratio=0.1):
+    return max(1, math.ceil(num_nodes * ratio))
+
+
 def score_dict_to_array(scores, nodes):
     return np.array([scores.get(node, 0.0) for node in nodes], dtype=float)
 
@@ -878,6 +1018,16 @@ def spearman_corr(exact, approx, nodes):
     rank2 = rankdata(data2, method='average')
     rho, _ = spearmanr(rank1, rank2)
     return rho
+
+
+def pearson_corr(exact, approx, nodes):
+    data1 = score_dict_to_array(approx, nodes)
+    data2 = score_dict_to_array(exact, nodes)
+    std1 = np.std(data1)
+    std2 = np.std(data2)
+    if std1 <= 1e-15 or std2 <= 1e-15:
+        return float('nan')
+    return float(np.corrcoef(data1, data2)[0, 1])
 
 
 def evaluate_method(method_name, runner, exact_scores, nodes, top_k):
@@ -957,7 +1107,7 @@ def build_pairwise_spearman_rows(score_by_method, nodes, row_metadata):
     return rows
 
 
-def build_row_metadata(graph_name, graph_source, num_nodes, num_edges, epsilon, top_k, exact_time):
+def build_row_metadata(graph_name, graph_source, num_nodes, num_edges, epsilon, top_k, top_k_ratio, exact_time):
     return {
         'graph_name': graph_name,
         'graph_source': graph_source,
@@ -965,6 +1115,7 @@ def build_row_metadata(graph_name, graph_source, num_nodes, num_edges, epsilon, 
         'num_edges': num_edges,
         'epsilon': epsilon,
         'top_k': top_k,
+        'top_k_ratio': top_k_ratio,
         'exact_time': exact_time,
     }
 
@@ -973,9 +1124,12 @@ def evaluate_experiment_record(record):
     exact = record['exact_scores']
     nodes = sorted(exact.keys())
     method_order = record['method_order']
+    top_k_ratio = record.get('top_k_ratio', 0.1)
+    effective_top_k = topk_count(record['num_nodes'], top_k_ratio)
 
     time_rows = []
     acc_rows = []
+    pcc_rows = []
     spearman_rows = []
 
     for epsilon_result in record['epsilon_results']:
@@ -985,25 +1139,29 @@ def evaluate_experiment_record(record):
             record['num_nodes'],
             record['num_edges'],
             epsilon_result['epsilon'],
-            record['top_k'],
+            effective_top_k,
+            top_k_ratio,
             record['exact_time'],
         )
 
         time_row = dict(row_metadata)
         acc_row = dict(row_metadata)
+        pcc_row = dict(row_metadata)
         score_by_method = {'EXACT': exact}
 
         for method_name in method_order:
             method_result = epsilon_result['method_results'][method_name]
             time_row[method_name] = method_result['runtime']
-            acc_row[method_name] = topk_accuracy(exact, method_result['scores'], k=record['top_k'])
+            acc_row[method_name] = topk_accuracy(exact, method_result['scores'], k=effective_top_k)
+            pcc_row[method_name] = pearson_corr(exact, method_result['scores'], nodes)
             score_by_method[method_name] = method_result['scores']
 
         time_rows.append(time_row)
         acc_rows.append(acc_row)
+        pcc_rows.append(pcc_row)
         spearman_rows.extend(build_pairwise_spearman_rows(score_by_method, nodes, row_metadata))
 
-    return time_rows, acc_rows, spearman_rows
+    return time_rows, acc_rows, pcc_rows, spearman_rows
 
 # ---------------------------------------------------------
 # 5. 数据加载
@@ -1015,8 +1173,8 @@ def relabel_graph_to_integers(graph: nx.Graph) -> nx.Graph:
 
 def load_real_graph(graph_path: Path) -> nx.Graph:
     graph = nx.read_edgelist(graph_path, nodetype=int)
-    if not isinstance(graph, nx.Graph) or graph.is_directed():
-        graph = nx.Graph(graph)
+    # if not isinstance(graph, nx.Graph) or graph.is_directed():
+    graph = nx.Graph(graph)
     # ABRA 等方法依赖 0..n-1 的连续节点编号，真实数据需要先重编号。
     return relabel_graph_to_integers(graph)
 
@@ -1086,7 +1244,140 @@ def iter_synthetic_graphs(seed: int = SEED) -> Iterator[Tuple[str, nx.Graph]]:
             G = ensure_connected(G)
 
         yield name, G
+        
+def infected_beta(graph):
+    # SIR模型的感染率设置
+    degree = nx.degree(graph)
+    degree_list = []
+    degree_sq_list = []
+    for i in degree:
+        degree_list.append(i[1])
+        degree_sq_list.append(i[1] * i[1])
+    degree_avg = np.mean(degree_list)
+    degree_avg_sq = np.mean(degree_sq_list)
+    infected = degree_avg / (degree_avg_sq -  2 *degree_avg)
+    return infected
 
+
+def build_method_runner(method_name: str, G: nx.Graph, epsilon: float):
+    if method_name == 'BP':
+        return lambda: BP_sampling_bc(G, epsilon)
+    if method_name == 'RK':
+        return lambda: RK(G, epsilon, 0.1)
+    if method_name == 'ABRA':
+        return lambda: ABRA(G, epsilon, 0.1, 1e5)
+    if method_name == 'SILVAN':
+        return lambda: SILVAN(G, epsilon, delta=0.05, c=5).run_fast(
+            max_iterations=50,
+            batch_size=20,
+        )
+    if method_name == 'GPU_SIR_BRIDGE':
+        gamma = 0.5  # 免疫率
+        beta = 2 * infected_beta(G) * gamma + 0.3  # 传播率
+        # gamma = 0.1  # 免疫率
+        # beta = 0.3
+        if GPU_SIR_BRIDGE_MODE == "single_source":
+            return lambda: compute_gpu_bridge_centrality(
+                G,
+                beta=beta,
+                gamma=gamma,
+                sources=None,
+                **GPU_SIR_BRIDGE_SINGLE_CONFIG,
+            )
+        if GPU_SIR_BRIDGE_MODE == "random_sources":
+            return lambda: compute_gpu_bridge_centrality_random_sources(
+                G,
+                beta=beta,
+                gamma=gamma,
+                **GPU_SIR_BRIDGE_RANDOM_SOURCES_CONFIG,
+            )
+        raise ValueError(
+            "GPU_SIR_BRIDGE_MODE must be 'single_source' or 'random_sources'"
+        )
+    raise ValueError(f"Unknown method: {method_name}")
+
+
+def evaluate_methods_for_epsilon(
+    G: nx.Graph,
+    exact_scores,
+    nodes,
+    top_k: int,
+    epsilon: float,
+    method_names: List[str],
+):
+    return {
+        method_name: evaluate_method(
+            method_name,
+            build_method_runner(method_name, G, epsilon),
+            exact_scores,
+            nodes,
+            top_k,
+        )
+        for method_name in method_names
+    }
+
+
+def build_saved_graph_lookup(seed: int = SEED):
+    graph_lookup = {}
+    seed_lookup = {}
+
+    for index, (graph_name, graph) in enumerate(iter_synthetic_graphs(seed=seed), start=1):
+        key = ("synthetic", graph_name)
+        graph_lookup[key] = graph
+        seed_lookup[key] = seed + index
+
+    real_graph_offset = 1000
+    for index, (graph_name, graph) in enumerate(iter_real_graphs(DATA_DIR), start=1):
+        key = ("real", graph_name)
+        graph_lookup[key] = graph
+        seed_lookup[key] = seed + real_graph_offset + index
+
+    return graph_lookup, seed_lookup
+
+
+def rerun_method_for_saved_experiments(method_name: str, seed: int = SEED):
+    records = load_experiment_records()
+    if not records:
+        print("No saved experiment records found in result/raw.")
+        return
+
+    graph_lookup, seed_lookup = build_saved_graph_lookup(seed=seed)
+    updated_count = 0
+
+    for record in records:
+        record_key = (record['graph_source'], record['graph_name'])
+        graph = graph_lookup.get(record_key)
+        if graph is None:
+            print(f"Skip missing graph definition: {record['graph_source']}/{record['graph_name']}")
+            continue
+
+        print("===================================")
+        print(f"Re-running {method_name}: {record['graph_source']}/{record['graph_name']}")
+        print("===================================")
+
+        set_global_seed(seed_lookup[record_key])
+        exact_scores = record['exact_scores']
+        nodes = sorted(exact_scores.keys())
+        top_k_ratio = record.get('top_k_ratio', 0.1)
+        top_k = topk_count(record['num_nodes'], top_k_ratio)
+
+        for epsilon_result in record['epsilon_results']:
+            epsilon = epsilon_result['epsilon']
+            epsilon_result['method_results'][method_name] = evaluate_method(
+                method_name,
+                build_method_runner(method_name, graph, epsilon),
+                exact_scores,
+                nodes,
+                top_k,
+            )
+
+        if method_name not in record['method_order']:
+            record['method_order'].append(method_name)
+
+        save_experiment_record(record)
+        updated_count += 1
+
+    print(f"Updated {updated_count} saved experiment records for {method_name}.")
 
 # ---------------------------------------------------------
 # 6. 实验主函数
@@ -1114,7 +1405,8 @@ def run_experiment(G, graph_name, graph_source):
 
     print("Exact Time:", round(exact_time, 4), "s")
 
-    top_k = 100
+    top_k_ratio = 0.1
+    top_k = topk_count(G.number_of_nodes(), top_k_ratio)
     epsilon_sizes = [0.2]  # [0.5, 0.3, 0.2, 0.1]
     method_order = ['BP', 'RK', 'ABRA', 'SILVAN', 'GPU_SIR_BRIDGE']
     epsilon_results = []
@@ -1124,61 +1416,14 @@ def run_experiment(G, graph_name, graph_source):
     # -----------------------------------
 
     for epsilon in epsilon_sizes:
-        method_results = {
-            'BP': evaluate_method(
-                'BP',
-                lambda: BP_sampling_bc(G, epsilon),
-                exact,
-                nodes,
-                top_k,
-            ),
-            'RK': evaluate_method(
-                'RK',
-                lambda: RK(G, epsilon, 0.1),
-                exact,
-                nodes,
-                top_k,
-            ),
-            'ABRA': evaluate_method(
-                'ABRA',
-                lambda: ABRA(G, epsilon, 0.1, 1e5),
-                exact,
-                nodes,
-                top_k,
-            ),
-            'SILVAN': evaluate_method(
-                'SILVAN',
-                lambda: SILVAN(G, epsilon, delta=0.05, c=5).run_fast(
-                    max_iterations=50,
-                    batch_size=20,
-                ),
-                exact,
-                nodes,
-                top_k,
-            ),
-            'GPU_SIR_BRIDGE': evaluate_method(
-                'GPU_SIR_BRIDGE',
-                lambda: compute_gpu_bridge_centrality(
-                    G,
-                    beta=0.3,
-                    gamma=0.1,
-                    steps=10,
-                    sources=None,
-                    batch_size=256,
-                    weight_attr=None,
-                    directed=False,
-                    device=None,
-                    eps=1e-8,
-                    normalize=False,
-                    return_hist=False,
-                    early_stop=False,
-                    threshold=1e-8,
-                ),
-                exact,
-                nodes,
-                top_k,
-            ),
-        }
+        method_results = evaluate_methods_for_epsilon(
+            G,
+            exact,
+            nodes,
+            top_k,
+            epsilon,
+            method_order,
+        )
 
         epsilon_results.append({
             'epsilon': epsilon,
@@ -1191,6 +1436,7 @@ def run_experiment(G, graph_name, graph_source):
         'num_nodes': G.number_of_nodes(),
         'num_edges': G.number_of_edges(),
         'top_k': top_k,
+        'top_k_ratio': top_k_ratio,
         'exact_time': exact_time,
         'exact_scores': exact,
         'method_order': method_order,
@@ -1227,16 +1473,19 @@ def evaluate_saved_experiments():
 
     time_rows = []
     acc_rows = []
+    pcc_rows = []
     spearman_rows = []
 
     for record in records:
-        record_time_rows, record_acc_rows, record_spearman_rows = evaluate_experiment_record(record)
+        record_time_rows, record_acc_rows, record_pcc_rows, record_spearman_rows = evaluate_experiment_record(record)
         time_rows.extend(record_time_rows)
         acc_rows.extend(record_acc_rows)
+        pcc_rows.extend(record_pcc_rows)
         spearman_rows.extend(record_spearman_rows)
 
     write_metric_csv('time.csv', time_rows)
     write_metric_csv('acc.csv', acc_rows)
+    write_metric_csv('pcc.csv', pcc_rows)
     write_metric_csv('spearman.csv', spearman_rows)
 
 
