@@ -18,7 +18,7 @@ from scipy.stats import spearmanr
 from scipy.stats import rankdata
 
 BASE_DIR = Path(__file__).resolve().parent
-RESULT_DIR = BASE_DIR / "result"
+RESULT_DIR = BASE_DIR / "result_v1"
 RAW_RESULT_DIR = RESULT_DIR / "raw"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SEED = 42
